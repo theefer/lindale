@@ -8,6 +8,13 @@ require './xmmsclient-qt4'
 # FIXME: uh oh!
 # GC.disable
 
+# TODO:
+# - keep playlist up-to-date wrt updates (complete cache, signals)
+# - use columns to separate fields
+# - type in playlist to filter playlist entries (custom search)
+# - isolate commands/panes in classes
+
+
 
 # FIXME: Could this proxy be merged into MediaItemModel?
 class Cache < Qt::Object
@@ -63,7 +70,7 @@ class Cache < Qt::Object
   def listenPos(pos)
     emit updatePos(@currpos, pos.value)
     @currpos = pos.value
-  end    
+  end
 
   def listenStatus(status)
     emit updateStatus(@currstatus, status.value)
@@ -86,6 +93,7 @@ class MediaItemModel < Qt::StandardItemModel
 
     @xc = conn
     @cache = cache
+    @filter_ids = Array.new
 
     connect(@cache, SIGNAL('entryUpdated(int)'), self, SLOT('updateMedia(int)'))
     connect(@cache, SIGNAL('updatePos(int, int)'), self, SLOT('updateCurrPos(int, int)'))
@@ -94,6 +102,14 @@ class MediaItemModel < Qt::StandardItemModel
 #    setHorizontalHeaderLabels(["", "Title"])
 
     self
+  end
+
+  def filter(pattern)
+    coll = Xmms::Collection.parse(pattern)
+    @xc.coll_query_ids(coll) do |res|
+      @filter_ids.clear
+      @filter_ids = res.value
+    end
   end
 
   def updatePlaylist(type, id, pos)
@@ -115,6 +131,7 @@ class MediaItemModel < Qt::StandardItemModel
         text = ""
         text += metadata[:artist] + " - " unless metadata[:artist].nil?
         text += metadata[:title] unless metadata[:title].nil?
+        text = metadata[:url] if text.empty?
         it.setData(Qt::Variant.new(text), Qt::DisplayRole)
         it.setData(Qt::Variant.new(true), READY_ROLE)
       end
@@ -170,6 +187,7 @@ class MediaDelegate < Qt::ItemDelegate
 
     if parent.selectionModel.isSelected(index)
       painter.fillRect(option.rect, option.palette.highlight)
+      painter.setPen(Qt::Color.new(Qt::white))
     end
     painter.drawText(option.rect, Qt::AlignLeft, text)
     painter.restore
@@ -211,7 +229,6 @@ class MyWidget < Qt::Widget
 
     @mlib = Qt::ListView.new
     #    @mlib.setModel(items)
-    @mlib.hide
 
     shortcut_tab = Qt::Shortcut.new(Qt::KeySequence.new("Tab"), self)
     shortcut_ctrltab = Qt::Shortcut.new(Qt::KeySequence.new("Ctrl+Tab"), self)
@@ -268,9 +285,10 @@ class MyWidget < Qt::Widget
       pause
     when "egg"
       tab
-    when /^list(\s.+)?/
+    when /^list(\s.+)?$/
+      @playlist.model.filter($1.strip) unless $1.nil?
       @stack.setCurrentWidget(@playlist)
-    when /^search(\s.+)?/
+    when /^search(\s.+)?$/
       # FIXME: search
       @stack.setCurrentWidget(@mlib)
     end
@@ -294,6 +312,7 @@ widget = MyWidget.new(xc)
 
 mainwin = Qt::MainWindow.new
 mainwin.setCentralWidget(widget)
+mainwin.setWindowTitle("lindalë")
 sb = mainwin.statusBar
 mainwin.show
 
