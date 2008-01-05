@@ -12,15 +12,42 @@ require './xmmsclient-qt4'
 # - type in playlist to filter playlist entries (custom search)
 # - actions should report a status message
 # - share cache module variables among panes
+# - reuse search results (activate to play, enqueue, copy, etc)
 
 
-module Xmms2Cache
-  def init_playback_status(xc)
+class Xmms2Cache < Qt::Object
+
+  signals 'metadata_received(int)'
+
+  def initialize(conn)
+    super()
+
+    @xc = conn
+  end
+
+  def init_playback_status()
     unless defined?(@playback_status)
       @playback_status = nil
-      xc.playback_status.notifier(&method(:listen_status))
-      xc.broadcast_playback_status.notifier(&method(:listen_status))
+      @xc.playback_status.notifier(&method(:listen_status))
+      @xc.broadcast_playback_status.notifier(&method(:listen_status))
     end
+  end
+
+  def has_mediainfos?(id)
+    @mediainfos = Hash.new unless defined?(@mediainfos)
+    return @mediainfos.key?(id)
+  end
+
+  def fetch_mediainfos(id)
+    return @mediainfos[id] if has_mediainfos?(id)
+
+    @mediainfos[id] = nil
+    @xc.medialib_get_info(id) do |dict|
+      @mediainfos[id] = dict.value
+      emit metadata_received(id)
+    end
+
+    return nil
   end
 
   private
@@ -52,16 +79,16 @@ end
 
 # sends simple commands to the xmms2 server, without any interface
 class Control < Pane
-  include Xmms2Cache
 
-  def initialize(xc)
+  def initialize(xc, cache)
     super()
 
     @xc = xc
+    @cache = cache
 
     # init cache
-    init_playback_status(@xc)
-    init_playback_status(@xc)
+    @cache.init_playback_status
+    @cache.init_playback_status
   end
 
   def run(arguments, register_opts = nil)
@@ -78,7 +105,7 @@ class Control < Pane
       @xc.playback_stop
 
     when :toggleplay
-      if @playback_status == Xmms::Client::PLAY
+      if @cache.playback_status == Xmms::Client::PLAY
         @xc.playback_pause
       else
         @xc.playback_start
@@ -91,8 +118,80 @@ class Control < Pane
 end
 
 
+class MediaItem < Qt::StandardItem
+
+  MEDIA_ID_ROLE   = Qt::UserRole + 0
+  READY_ROLE      = Qt::UserRole + 1
+
+  def initialize(id)
+    super()
+    setData(Qt::Variant.new(id), MEDIA_ID_ROLE)
+    setData(Qt::Variant.new(id), Qt::DisplayRole)
+    setData(Qt::Variant.new(false), READY_ROLE)
+    setEditable(false)
+
+    self
+  end
+
+  def set_metadata(metadata)
+    text = ""
+    text += metadata[:artist] + " - " unless metadata[:artist].nil?
+    text += metadata[:title] unless metadata[:title].nil?
+    text = metadata[:url] if text.empty?
+    setData(Qt::Variant.new(text), Qt::DisplayRole)
+    setData(Qt::Variant.new(true), READY_ROLE)
+  end
+
+  def mid()
+    return data(MediaItem::MEDIA_ID_ROLE).toUInt
+  end
+
+  def id()
+    return mid
+  end
+end
+
+class MediaItemModel < Qt::StandardItemModel
+
+  slots 'update_metadata(int)'
+
+  def initialize(cache)
+    super()
+
+    @cache = cache
+
+    connect(@cache, SIGNAL('metadata_received(int)'), self, SLOT('update_metadata(int)'))
+
+    self
+  end
+
+  def append_id(id)
+    item = MediaItem.new(id)
+    appendRow(item)
+    item.set_metadata(@cache.fetch_mediainfos(id)) if @cache.has_mediainfos?(id)
+  end
+
+  def update_metadata(id)
+    metadata = @cache.fetch_mediainfos(id)
+    for i in 0...rowCount
+      it = item(i)
+      it.set_metadata(metadata) if it.mid == id
+    end
+  end
+
+  def data(idx, role = Qt::DisplayRole)
+    unless super(idx, MediaItem::READY_ROLE).toBool
+      id = super(idx, MediaItem::MEDIA_ID_ROLE).toInt
+      @cache.fetch_mediainfos(id)
+    end
+
+    super(idx, role)
+  end
+end
+
+
 class Playlist < Pane
-  def initialize(xc)
+  def initialize(xc, cache)
     super()
 
     @xc = xc
@@ -107,13 +206,17 @@ end
 
 
 class Search < Pane
-  def initialize(xc)
+  def initialize(xc, cache)
     super()
 
     @xc = xc
-    @mlib = Qt::ListView.new
+    @cache = cache
 
-    # FIXME: needs cache
+    @mlib = Qt::ListView.new
+    @results = MediaItemModel.new(@cache)
+    @mlib.setModel(@results)
+    @mlib.setSelectionMode(Qt::AbstractItemView::ExtendedSelection)
+    @mlib.setAlternatingRowColors(true)
   end
 
   def widget
@@ -121,7 +224,11 @@ class Search < Pane
   end
 
   def run(arguments, register_opts = nil)
-    # FIXME: run search, show results
+    coll = Xmms::Collection.parse(arguments)
+    @xc.coll_query_ids(coll) do |res|
+      @results.clear
+      res.value.each {|id| @results.append_id(id)}
+    end
   end
 end
 
@@ -222,14 +329,15 @@ xc = Xmms::Client::Async.new("lindale")
 xc.connect(ENV["XMMS_PATH"])
 xc.add_to_qt4_mainloop
 
+cache = Xmms2Cache.new(xc)
 
 # teh app
 lindale = Lindale.new
 
 # prepare panes
-ctrl = Control.new(xc)
-search = Search.new(xc)
-playlist = Playlist.new(xc)
+ctrl = Control.new(xc, cache)
+search = Search.new(xc, cache)
+playlist = Playlist.new(xc, cache)
 
 # register commands
 lindale.add_command('search', search)
