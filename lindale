@@ -7,18 +7,17 @@ require './xmmsclient-qt4'
 
 
 # TODO:
-# - keep playlist up-to-date wrt updates (complete cache, signals)
 # - use columns to separate fields
 # - type in playlist to filter playlist entries (custom search)
 # - actions should report a status message
-# - share cache module variables among panes
 # - reuse search results (activate to play, enqueue, copy, etc)
 
 
 class Xmms2Cache < Qt::Object
 
   signals 'metadata_received(int)', 'status_updated(int, int)', 'position_updated(int, int)',
-          'playlist_refreshed()'
+          'playlist_refreshed()', 'playlist_entry_inserted(int, int)',
+          'playlist_entry_removed(int)'
 
   attr_reader :playback_status, :playlist_position, :playlist_entries
 
@@ -87,13 +86,46 @@ class Xmms2Cache < Qt::Object
     emit playlist_refreshed()
   end
 
-  def listen_playlist_changes(desc)
-#    emit playlist_refresh()
+  def listen_playlist_changes(res)
+    # FIXME: check that desc[:name] == active
+    desc = res.value
+    case desc[:type]
+    when Xmms::Playlist::ADD
+      @playlist_entries.push(desc[:id])
+      emit playlist_entry_inserted(desc[:id], @playlist_entries.size - 1)
+
+    when Xmms::Playlist::INSERT
+      @playlist_entries.insert(desc[:position], desc[:id])
+      emit playlist_entry_inserted(desc[:id], desc[:position])
+
+    when Xmms::Playlist::REMOVE
+      @playlist_entries.delete_at(desc[:position])
+      emit playlist_entry_removed(desc[:position])
+
+    when Xmms::Playlist::MOVE
+      @playlist_entries.delete_at(desc[:position])
+      @playlist_entries.insert(desc[:newposition], desc[:id])
+      emit playlist_entry_removed(desc[:position])
+      emit playlist_entry_inserted(desc[:id], desc[:newposition])
+      # FIXME: check that pos is correct
+
+    when Xmms::Playlist::CLEAR
+      @playlist_entries.clear
+      emit playlist_refreshed()
+
+    when Xmms::Playlist::UPDATE, Xmms::Playlist::SORT, Xmms::Playlist::SHUFFLE
+      @xc.playlist.entries.notifier(&method(:listen_playlist_entries))
+    else
+      # FIXME: some kind of error <:o)
+    end
   end
 end
 
 
 class Pane < Qt::Object
+
+  # need to be redeclared in the child class!
+  signals 'message(const QString&)', 'warning(const QString&)', 'error(const QString&)'
 
   # return the Qt::Widget of the pane, or nil if none
   def widget
@@ -109,14 +141,13 @@ class Pane < Qt::Object
   def initialize()
     super()
   end
-
-  def message(m)
-  end
 end
 
 
 # sends simple commands to the xmms2 server, without any interface
 class Control < Pane
+
+  signals 'message(const QString&)', 'warning(const QString&)', 'error(const QString&)'
 
   def initialize(xc, cache)
     super()
@@ -134,18 +165,23 @@ class Control < Pane
     case register_opts
     when :play
       @xc.playback_start
+      emit message("Playback started.")
 
     when :pause
       @xc.playback_pause
+      emit message("Playback paused.")
 
     when :stop
       @xc.playback_stop
+      emit message("Playback stopped.")
 
     when :toggleplay
       if @cache.playback_status == Xmms::Client::PLAY
         @xc.playback_pause
+        emit message("Playback paused.")
       else
         @xc.playback_start
+        emit message("Playback started.")
       end
 
     else
@@ -210,6 +246,16 @@ class MediaItemModel < Qt::StandardItemModel
     item.set_metadata(@cache.fetch_mediainfos(id)) if @cache.has_mediainfos?(id)
   end
 
+  def insert_id(pos, id)
+    item = MediaItem.new(id)
+    insertRow(pos, item)
+    item.set_metadata(@cache.fetch_mediainfos(id)) if @cache.has_mediainfos?(id)
+  end
+
+  def remove_pos(pos)
+    takeRow(pos)
+  end
+
   def update_metadata(id)
     metadata = @cache.fetch_mediainfos(id)
     for i in 0...rowCount
@@ -257,13 +303,16 @@ end
 class Playlist < Pane
 
   slots 'activate(const QModelIndex &)', 'update_position(int, int)',
-        'reset_playlist()'
+        'reset_playlist()', 'playlist_entry_insert(int, int)',
+        'playlist_entry_remove(int)'
 
   def initialize(xc, cache)
     super()
 
     @xc = xc
     @cache = cache
+
+    @filter_ids = nil
 
     @playlist = Qt::ListView.new
     @items = MediaItemModel.new(@cache)
@@ -277,6 +326,10 @@ class Playlist < Pane
             self, SLOT('update_position(int, int)'))
     connect(@cache, SIGNAL('playlist_refreshed()'),
             self, SLOT('reset_playlist()'))
+    connect(@cache, SIGNAL('playlist_entry_inserted(int, int)'),
+            self, SLOT('playlist_entry_insert(int, int)'))
+    connect(@cache, SIGNAL('playlist_entry_removed(int)'),
+            self, SLOT('playlist_entry_remove(int)'))
 
     connect(@playlist, SIGNAL('activated(const QModelIndex &)'),
             self, SLOT('activate(const QModelIndex &)'))
@@ -309,8 +362,36 @@ class Playlist < Pane
     @cache.playlist_entries.each {|id| @items.append_id(id)}
   end
 
+  def playlist_entry_insert(id, pos)
+    @items.insert_id(pos, id)
+  end
+
+  def playlist_entry_remove(pos)
+    @items.remove_pos(pos)
+  end
+
   def run(arguments, register_opts = nil)
-    # FIXME: filter playlist
+    # FIXME: filter/reset should reread position
+    if arguments.nil?
+      # Reset filter
+      @filter_ids = nil
+      reset_playlist
+    else
+      # Filter playlist
+      coll = Xmms::Collection.parse(arguments)
+      @xc.coll_query_ids(coll) do |res|
+        @filter_ids = res.value
+        apply_filter
+      end
+    end
+  end
+
+  def apply_filter()
+    # FIXME: ugly, suboptimal
+    @items.clear
+    (@cache.playlist_entries & @filter_ids).each do |id|
+      @items.append_id(id)
+    end
   end
 end
 
@@ -334,6 +415,9 @@ class Search < Pane
   end
 
   def run(arguments, register_opts = nil)
+    # FIXME: show all?
+    return if arguments.nil?
+
     coll = Xmms::Collection.parse(arguments)
     @xc.coll_query_ids(coll) do |res|
       @results.clear
@@ -365,13 +449,17 @@ class Lindale < Qt::Widget
   end
 
 
-  slots 'run()', 'next_pane()', 'switch_focus()'
+  slots 'run()', 'next_pane()', 'switch_focus()',
+        'show_message(const QString&)', 'show_warning(const QString&)', 'show_error(const QString&)'
 
   def initialize()
     super()
 
+    @status_bar_timeout = 2000
+
     @stack = Qt::StackedWidget.new
     @commands = Hash.new
+    @panes = Array.new
 
     @cmd = Qt::LineEdit.new
 
@@ -394,11 +482,23 @@ class Lindale < Qt::Widget
   end
 
   def add_command(cmd, target, opt = nil)
-    unless target.widget.nil? or @stack.indexOf(target.widget) != -1
-      @stack.addWidget(target.widget)
+    unless @panes.include?(target)
+      # add widget to stack if exists
+      unless target.widget.nil?
+        @stack.addWidget(target.widget)
+      end
+
+      # connect status notifiers
+      connect(target, SIGNAL('message(const QString&)'),
+              self, SLOT('show_message(const QString&)'))
+      connect(target, SIGNAL('warning(const QString&)'),
+              self, SLOT('show_warning(const QString&)'))
+      connect(target, SIGNAL('error(const QString&)'),
+              self, SLOT('show_error(const QString&)'))
     end
 
     @commands[cmd] = Command.new(target, opt)
+    @panes.push(target)
     self
   end
 
@@ -412,12 +512,12 @@ class Lindale < Qt::Widget
 
   def run()
     input = @cmd.text
-    input.scan(/^(.*?)(?:\s+(.+))?$/) do ||
+    input.scan(/^(.*?)(?:\s+(.+)?)?$/) do ||
       cmd_str = $1
       command = @commands[cmd_str]
 
       if command.nil?
-        puts "invalid command: " + cmd_str
+        show_error("invalid command: #{cmd_str}")
       else
         @stack.setCurrentWidget(command.widget) if command.has_widget?
         command.run($2)
@@ -436,6 +536,18 @@ class Lindale < Qt::Widget
     else
       @cmd.setFocus(Qt::TabFocusReason)
     end
+  end
+
+  def show_message(m)
+    parent.statusBar.showMessage(m, @status_bar_timeout)
+  end
+  def show_warning(m)
+    # FIXME: change background color
+    parent.statusBar.showMessage(m, @status_bar_timeout)
+  end
+  def show_error(m)
+    # FIXME: change background color
+    parent.statusBar.showMessage(m, @status_bar_timeout)
   end
 end
 
@@ -471,7 +583,6 @@ lindale.add_alias('search', 's', '?')
 mainwin = Qt::MainWindow.new
 mainwin.setCentralWidget(lindale)
 mainwin.setWindowTitle("lindalë")
-sb = mainwin.statusBar
 mainwin.show
 
 app.exec()
