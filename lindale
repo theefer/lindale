@@ -17,7 +17,10 @@ require './xmmsclient-qt4'
 
 class Xmms2Cache < Qt::Object
 
-  signals 'metadata_received(int)'
+  signals 'metadata_received(int)', 'status_updated(int, int)', 'position_updated(int, int)',
+          'playlist_refreshed()'
+
+  attr_reader :playback_status, :playlist_position, :playlist_entries
 
   def initialize(conn)
     super()
@@ -30,6 +33,22 @@ class Xmms2Cache < Qt::Object
       @playback_status = nil
       @xc.playback_status.notifier(&method(:listen_status))
       @xc.broadcast_playback_status.notifier(&method(:listen_status))
+    end
+  end
+
+  def init_playlist_position()
+    unless defined?(@playlist_position)
+      @playlist_position = nil
+      @xc.playlist.current_pos.notifier(&method(:listen_position))
+      @xc.broadcast_playlist_current_pos.notifier(&method(:listen_position))
+    end
+  end
+
+  def init_playlist_entries()
+    unless defined?(@playlist_entries)
+      @playlist_entries = nil
+      @xc.playlist.entries.notifier(&method(:listen_playlist_entries))
+      @xc.broadcast_playlist_changed.notifier(&method(:listen_playlist_changes))
     end
   end
 
@@ -52,12 +71,30 @@ class Xmms2Cache < Qt::Object
 
   private
   def listen_status(status)
+    old_status = if @playback_status.nil? then -1 else @playback_status end
     @playback_status = status.value
-  end    
+    emit status_updated(old_status, @playback_status)
+  end
+
+  def listen_position(pos)
+    old_pos = if @playlist_position.nil? then -1 else @playlist_position end
+    @playlist_position = pos.value
+    emit position_updated(old_pos, @playlist_position)
+  end
+
+  def listen_playlist_entries(entries)
+    @playlist_entries = entries.value
+    emit playlist_refreshed()
+  end
+
+  def listen_playlist_changes(desc)
+#    emit playlist_refresh()
+  end
 end
 
 
-class Pane
+class Pane < Qt::Object
+
   # return the Qt::Widget of the pane, or nil if none
   def widget
     return nil
@@ -70,6 +107,7 @@ class Pane
 
   private
   def initialize()
+    super()
   end
 
   def message(m)
@@ -87,7 +125,6 @@ class Control < Pane
     @cache = cache
 
     # init cache
-    @cache.init_playback_status
     @cache.init_playback_status
   end
 
@@ -122,6 +159,8 @@ class MediaItem < Qt::StandardItem
 
   MEDIA_ID_ROLE   = Qt::UserRole + 0
   READY_ROLE      = Qt::UserRole + 1
+  CURRENT_ROLE    = Qt::UserRole + 2
+  #FIXME: CURRENT_ROLE should be playlist-specific?
 
   def initialize(id)
     super()
@@ -189,14 +228,85 @@ class MediaItemModel < Qt::StandardItemModel
   end
 end
 
+class MediaDelegate < Qt::ItemDelegate
+  def initialize(parent)
+    super(parent)
+  end
+
+  def paint(painter, option, index)
+    # FIXME: Do something sexy later on instead
+    curr = index.model.data(index, MediaItem::CURRENT_ROLE).toBool
+    text = index.model.data(index, Qt::DisplayRole).toString
+
+    painter.save
+    font = option.font
+    font.setBold(true) if curr
+    painter.setFont(font)
+
+    if parent.selectionModel.isSelected(index)
+      painter.fillRect(option.rect, option.palette.highlight)
+      painter.setPen(Qt::Color.new(Qt::white))
+    end
+    painter.drawText(option.rect, Qt::AlignLeft, text)
+    painter.restore
+#    super(painter, option, index)
+  end
+end
+
 
 class Playlist < Pane
+
+  slots 'activate(const QModelIndex &)', 'update_position(int, int)',
+        'reset_playlist()'
+
   def initialize(xc, cache)
     super()
 
     @xc = xc
+    @cache = cache
 
-    # FIXME: needs cache
+    @playlist = Qt::ListView.new
+    @items = MediaItemModel.new(@cache)
+    @deleg = MediaDelegate.new(@playlist)
+    @playlist.setModel(@items)
+    @playlist.setItemDelegate(@deleg)
+    @playlist.setSelectionMode(Qt::AbstractItemView::ExtendedSelection)
+    @playlist.setAlternatingRowColors(true)
+
+    connect(@cache, SIGNAL('position_updated(int, int)'),
+            self, SLOT('update_position(int, int)'))
+    connect(@cache, SIGNAL('playlist_refreshed()'),
+            self, SLOT('reset_playlist()'))
+
+    connect(@playlist, SIGNAL('activated(const QModelIndex &)'),
+            self, SLOT('activate(const QModelIndex &)'))
+
+    @cache.init_playlist_entries
+    @cache.init_playlist_position
+  end
+
+  def widget
+    return @playlist
+  end
+
+  def activate(item)
+    @xc.playlist_set_next(item.row)
+    @xc.playback_tickle
+    @xc.playback_start unless @cache.playback_status == Xmms::Client::PLAY
+  end
+
+  def update_position(prev, new)
+    if @items.hasIndex(prev, 0)
+      @items.item(prev).setData(Qt::Variant.new(false), MediaItem::CURRENT_ROLE)
+    end
+    if @items.hasIndex(new, 0)
+      @items.item(new).setData(Qt::Variant.new(true), MediaItem::CURRENT_ROLE)
+    end
+  end
+
+  def reset_playlist()
+    @items.clear
+    @cache.playlist_entries.each {|id| @items.append_id(id)}
   end
 
   def run(arguments, register_opts = nil)
@@ -239,6 +349,14 @@ class Lindale < Qt::Widget
     def initialize(target, opt)
       @target = target
       @option = opt
+    end
+
+    def has_widget?()
+      return ! widget.nil?
+    end
+
+    def widget()
+      return @target.widget
     end
 
     def run(args)
@@ -301,6 +419,7 @@ class Lindale < Qt::Widget
       if command.nil?
         puts "invalid command: " + cmd_str
       else
+        @stack.setCurrentWidget(command.widget) if command.has_widget?
         command.run($2)
       end
     end
@@ -335,13 +454,13 @@ cache = Xmms2Cache.new(xc)
 lindale = Lindale.new
 
 # prepare panes
-ctrl = Control.new(xc, cache)
-search = Search.new(xc, cache)
 playlist = Playlist.new(xc, cache)
+search = Search.new(xc, cache)
+ctrl = Control.new(xc, cache)
 
 # register commands
-lindale.add_command('search', search)
 lindale.add_command('list', playlist)
+lindale.add_command('search', search)
 lindale.add_command('play', ctrl, :play)
 lindale.add_command('pause', ctrl, :pause)
 lindale.add_command('stop', ctrl, :stop)
