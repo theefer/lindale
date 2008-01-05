@@ -1,0 +1,250 @@
+#!/usr/bin/ruby
+
+require 'Qt4'
+require 'xmmsclient/async'
+
+require './xmmsclient-qt4'
+
+
+# TODO:
+# - keep playlist up-to-date wrt updates (complete cache, signals)
+# - use columns to separate fields
+# - type in playlist to filter playlist entries (custom search)
+# - actions should report a status message
+# - share cache module variables among panes
+
+
+module Xmms2Cache
+  def init_playback_status(xc)
+    unless defined?(@playback_status)
+      @playback_status = nil
+      xc.playback_status.notifier(&method(:listen_status))
+      xc.broadcast_playback_status.notifier(&method(:listen_status))
+    end
+  end
+
+  private
+  def listen_status(status)
+    @playback_status = status.value
+  end    
+end
+
+
+class Pane
+  # return the Qt::Widget of the pane, or nil if none
+  def widget
+    return nil
+  end
+
+  # execute the command
+  def run(arguments, register_opts = nil)
+    # FIXME: throw NotImplem
+  end
+
+  private
+  def initialize()
+  end
+
+  def message(m)
+  end
+end
+
+
+# sends simple commands to the xmms2 server, without any interface
+class Control < Pane
+  include Xmms2Cache
+
+  def initialize(xc)
+    super()
+
+    @xc = xc
+
+    # init cache
+    init_playback_status(@xc)
+    init_playback_status(@xc)
+  end
+
+  def run(arguments, register_opts = nil)
+    # FIXME: use arguments?
+
+    case register_opts
+    when :play
+      @xc.playback_start
+
+    when :pause
+      @xc.playback_pause
+
+    when :stop
+      @xc.playback_stop
+
+    when :toggleplay
+      if @playback_status == Xmms::Client::PLAY
+        @xc.playback_pause
+      else
+        @xc.playback_start
+      end
+
+    else
+      # FIXME: error?
+    end
+  end
+end
+
+
+class Playlist < Pane
+  def initialize(xc)
+    super()
+
+    @xc = xc
+
+    # FIXME: needs cache
+  end
+
+  def run(arguments, register_opts = nil)
+    # FIXME: filter playlist
+  end
+end
+
+
+class Search < Pane
+  def initialize(xc)
+    super()
+
+    @xc = xc
+    @mlib = Qt::ListView.new
+
+    # FIXME: needs cache
+  end
+
+  def widget
+    return @mlib
+  end
+
+  def run(arguments, register_opts = nil)
+    # FIXME: run search, show results
+  end
+end
+
+
+class Lindale < Qt::Widget
+
+  class Command
+    def initialize(target, opt)
+      @target = target
+      @option = opt
+    end
+
+    def run(args)
+      @target.run(args, @option)
+    end
+  end
+
+
+  slots 'run()', 'next_pane()', 'switch_focus()'
+
+  def initialize()
+    super()
+
+    @stack = Qt::StackedWidget.new
+    @commands = Hash.new
+
+    @cmd = Qt::LineEdit.new
+
+    shortcut_tab = Qt::Shortcut.new(Qt::KeySequence.new("Tab"), self)
+    shortcut_ctrltab = Qt::Shortcut.new(Qt::KeySequence.new("Ctrl+Tab"), self)
+    shortcut_left = Qt::Shortcut.new(Qt::KeySequence.new("Ctrl+Left"), self)
+    shortcut_right = Qt::Shortcut.new(Qt::KeySequence.new("Ctrl+Right"), self)
+
+    connect(@cmd, SIGNAL('returnPressed()'), self, SLOT('run()'))
+
+    connect(shortcut_tab, SIGNAL('activated()'), self, SLOT('switch_focus()'))
+    connect(shortcut_ctrltab, SIGNAL('activated()'), self, SLOT('next_pane()'))
+    connect(shortcut_left, SIGNAL('activated()'), self, SLOT('next_pane()'))
+    connect(shortcut_right, SIGNAL('activated()'), self, SLOT('next_pane()'))
+
+    layout = Qt::VBoxLayout.new
+    layout.addWidget(@cmd)
+    layout.addWidget(@stack)
+    setLayout(layout)
+  end
+
+  def add_command(cmd, target, opt = nil)
+    unless target.widget.nil? or @stack.indexOf(target.widget) != -1
+      @stack.addWidget(target.widget)
+    end
+
+    @commands[cmd] = Command.new(target, opt)
+    self
+  end
+
+  def add_alias(cmd, *aliases)
+    # FIXME: error unless @commands.key?(cmd)
+    aliases.each do |alias_cmd|
+      @commands[alias_cmd] = @commands[cmd]
+    end
+    self
+  end
+
+  def run()
+    input = @cmd.text
+    input.scan(/^(.*?)(?:\s+(.+))?$/) do ||
+      cmd_str = $1
+      command = @commands[cmd_str]
+
+      if command.nil?
+        puts "invalid command: " + cmd_str
+      else
+        command.run($2)
+      end
+    end
+  end
+
+  def next_pane()
+    newIndex = (@stack.currentIndex + 1) % @stack.count
+    @stack.setCurrentIndex(newIndex)
+  end
+
+  def switch_focus()
+    if @cmd.hasFocus
+      @stack.currentWidget.setFocus(Qt::TabFocusReason)
+    else
+      @cmd.setFocus(Qt::TabFocusReason)
+    end
+  end
+end
+
+
+
+
+app = Qt::Application.new(ARGV)
+
+xc = Xmms::Client::Async.new("lindale")
+xc.connect(ENV["XMMS_PATH"])
+xc.add_to_qt4_mainloop
+
+
+# teh app
+lindale = Lindale.new
+
+# prepare panes
+ctrl = Control.new(xc)
+search = Search.new(xc)
+playlist = Playlist.new(xc)
+
+# register commands
+lindale.add_command('search', search)
+lindale.add_command('list', playlist)
+lindale.add_command('play', ctrl, :play)
+lindale.add_command('pause', ctrl, :pause)
+lindale.add_command('stop', ctrl, :stop)
+lindale.add_command('p', ctrl, :toggleplay)
+lindale.add_alias('search', 's', '?')
+
+
+mainwin = Qt::MainWindow.new
+mainwin.setCentralWidget(lindale)
+mainwin.setWindowTitle("lindalë")
+sb = mainwin.statusBar
+mainwin.show
+
+app.exec()
