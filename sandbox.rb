@@ -149,6 +149,53 @@ class MediaItemModel < Qt::StandardItemModel
 end
 
 
+class PlayListView < Qt::ListView
+  # FIXME: kinda ugly, no?
+  def initialize(*args)
+    super(*args)
+    @search = ""
+  end
+
+  def keyPressEvent(e)
+    # FIXME: Ctrl+Up/Down to move selection
+    if e.key == Qt::Key_Delete
+      # reorder to remove lowest first!
+      selectionModel.selectedRows.map {|x| x.row}.sort.reverse.each do |idx|
+        # FIXME: hey, update xmms2 too, not just the model!
+        model.removeRow(idx)
+      end
+      # FIXME: when to clear @search? lose focus, click, etc.
+      @search = ""
+    elsif e.key == Qt::Key_Return
+      # FIXME: ENTER (resp. ESC) to leave search and keep (resp. cancel) selection
+      @search = ""
+    elsif e.key == Qt::Key_Escape
+      selectionModel.clearSelection
+      @search = ""
+    elsif !e.text.nil? and !e.text.empty?
+      # FIXME: weird stuff with C-d, Backspace, etc
+      # FIXME: display search string somewhere
+      if e.key == Qt::Key_Backspace
+        @search.slice!(-1) unless @search == ""
+      else
+        @search << e.text
+      end
+      puts @search
+      selectionModel.clearSelection
+      if @search.size > 1
+        indices = model.match(currentIndex, Qt::DisplayRole,
+                              Qt::Variant.new(@search), -1,
+                              (Qt::MatchContains | Qt::MatchWrap))
+        indices.each do |idx|
+          selectionModel.select(idx, Qt::ItemSelectionModel::Select)
+        end
+      end
+    else
+      super(e)
+    end
+  end
+end
+
 class MediaItem < Qt::StandardItem
   def initialize(id)
     super()
@@ -209,7 +256,7 @@ class MyWidget < Qt::Widget
     @cmd = Qt::LineEdit.new
 
 #    @playlist = Qt::TableView.new
-    @playlist = Qt::ListView.new
+    @playlist = PlayListView.new
     items = MediaItemModel.new(@playlist, @xc, @cache)
     deleg = MediaDelegate.new(@playlist)
     @playlist.setModel(items)

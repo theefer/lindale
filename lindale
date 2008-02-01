@@ -11,7 +11,9 @@ require './xmmsclient-qt4'
 # - type in playlist to filter playlist entries (custom search)
 # - actions should report a status message
 # - reuse search results (activate to play, enqueue, copy, etc)
-
+# - rerequest entry metadata if not resolved yet
+# - lazy loading, only visible entries
+# - playlist: delete, move (ctrl+arrow) entries with keyboard
 
 class Xmms2Cache < Qt::Object
 
@@ -51,21 +53,24 @@ class Xmms2Cache < Qt::Object
     end
   end
 
+  def init_mediainfos()
+    unless defined?(@mediainfos)
+      @mediainfos = Hash.new
+      @xc.broadcast_medialib_entry_changed.notifier(&method(:listen_mlib_entry))
+    end
+  end
+
   def has_mediainfos?(id)
-    @mediainfos = Hash.new unless defined?(@mediainfos)
     return @mediainfos.key?(id)
   end
 
   def fetch_mediainfos(id)
-    return @mediainfos[id] if has_mediainfos?(id)
-
-    @mediainfos[id] = nil
-    @xc.medialib_get_info(id) do |dict|
-      @mediainfos[id] = dict.value
-      emit metadata_received(id)
+    if has_mediainfos?(id)
+      return @mediainfos[id]
+    else
+      update_mediainfos(id)
+      return nil
     end
-
-    return nil
   end
 
   private
@@ -117,6 +122,18 @@ class Xmms2Cache < Qt::Object
       @xc.playlist.entries.notifier(&method(:listen_playlist_entries))
     else
       # FIXME: some kind of error <:o)
+    end
+  end
+
+  def listen_mlib_entry(res)
+    update_mediainfos(res.value)
+  end
+
+  def update_mediainfos(id)
+    @mediainfos[id] = nil
+    @xc.medialib_get_info(id) do |dict|
+      @mediainfos[id] = dict.value
+      emit metadata_received(id)
     end
   end
 end
@@ -234,6 +251,7 @@ class MediaItemModel < Qt::StandardItemModel
     super()
 
     @cache = cache
+    @pending = Hash.new
 
     connect(@cache, SIGNAL('metadata_received(int)'), self, SLOT('update_metadata(int)'))
 
@@ -243,24 +261,34 @@ class MediaItemModel < Qt::StandardItemModel
   def append_id(id)
     item = MediaItem.new(id)
     appendRow(item)
-    item.set_metadata(@cache.fetch_mediainfos(id)) if @cache.has_mediainfos?(id)
+    set_metadata(id, item, rowCount - 1)
   end
 
   def insert_id(pos, id)
     item = MediaItem.new(id)
     insertRow(pos, item)
-    item.set_metadata(@cache.fetch_mediainfos(id)) if @cache.has_mediainfos?(id)
+    set_metadata(id, item, pos)
   end
 
   def remove_pos(pos)
     takeRow(pos)
   end
 
+  def set_metadata(id, item, pos)
+    if @cache.has_mediainfos?(id)
+      item.set_metadata(@cache.fetch_mediainfos(id))
+    else
+      @pending[id] = Array.new unless @pending.key?(id)
+      @pending[id].push(pos)
+    end
+  end
+
   def update_metadata(id)
     metadata = @cache.fetch_mediainfos(id)
-    for i in 0...rowCount
-      it = item(i)
-      it.set_metadata(metadata) if it.mid == id
+    # FIXME: hackish, errors!
+    return unless @pending.key?(id)
+    while pos = @pending[id].shift
+      item(pos).set_metadata(metadata) if pos < rowCount
     end
   end
 
@@ -336,6 +364,7 @@ class Playlist < Pane
 
     @cache.init_playlist_entries
     @cache.init_playlist_position
+    @cache.init_mediainfos
   end
 
   def widget
