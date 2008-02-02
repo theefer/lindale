@@ -7,10 +7,12 @@ require 'xmmsclient/async'
 class Xmms2Cache < Qt::Object
 
   signals 'metadata_received(int)', 'status_updated(int, int)', 'position_updated(int, int)',
-          'playlist_refreshed()', 'playlist_entry_inserted(int, int)',
+          'playlist_refreshed()', 'playlist_loaded(const QString&, const QString&)',
+          'playlist_entry_inserted(int, int)',
           'playlist_entry_removed(int)'
 
-  attr_reader :playback_status, :playlist_position, :playlist_entries
+  attr_reader :playback_status, :playlist_position, :playlist_entries,
+              :playlist_active
 
   def initialize(conn)
     super()
@@ -34,8 +36,19 @@ class Xmms2Cache < Qt::Object
     end
   end
 
+  def init_playlist_active()
+    unless defined?(@playlist_active)
+      @playlist_active = nil
+      @xc.playlist_current_active.notifier(&method(:listen_playlist_active))
+      @xc.broadcast_playlist_loaded.notifier(&method(:listen_playlist_active))
+    end
+  end
+
   def init_playlist_entries()
     unless defined?(@playlist_entries)
+      # we need to track the active playlist
+      init_playlist_active
+
       @playlist_entries = nil
       @xc.playlist.entries.notifier(&method(:listen_playlist_entries))
       @xc.broadcast_playlist_changed.notifier(&method(:listen_playlist_changes))
@@ -75,14 +88,22 @@ class Xmms2Cache < Qt::Object
     emit position_updated(old_pos, @playlist_position)
   end
 
+  def listen_playlist_active(name)
+    old_name = if @playlist_active.nil? then nil else @playlist_active end
+    @playlist_active = name.value
+    emit playlist_loaded(old_name, @playlist_active)
+  end
+
   def listen_playlist_entries(entries)
     @playlist_entries = entries.value
     emit playlist_refreshed()
   end
 
   def listen_playlist_changes(res)
-    # FIXME: check that desc[:name] == active
     desc = res.value
+
+    return if desc[:name] != @playlist_active
+
     case desc[:type]
     when Xmms::Playlist::ADD
       @playlist_entries.push(desc[:id])
